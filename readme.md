@@ -6,7 +6,7 @@ Enidu is a nadhi.dev product.
 
 
 
-```markdown
+
 
 
 ## API Documentation
@@ -23,7 +23,7 @@ Currently, the API doesn't require authentication.
 
 #### Get API Status
 
-```
+
 GET /api/v1
 ```
 

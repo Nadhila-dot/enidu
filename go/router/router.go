@@ -9,6 +9,7 @@ import (
     "strconv"
     "sync"
     "time"
+    "strings"
 
     "github.com/gofiber/fiber/v2"
     "github.com/gofiber/fiber/v2/middleware/cors"
@@ -69,6 +70,7 @@ type JobManager struct {
     stops  map[string]chan struct{}
     info   map[string]*JobInfo
     stats  map[string]*JobStats
+    active map[string]bool // Track active jobs that are still running
 }
 
 var manager = &JobManager{
@@ -76,6 +78,7 @@ var manager = &JobManager{
     stops:  make(map[string]chan struct{}),
     info:   make(map[string]*JobInfo),
     stats:  make(map[string]*JobStats),
+    active: make(map[string]bool),
 }
 
 // Generate a unique job ID
@@ -102,6 +105,7 @@ func (jm *JobManager) RegisterJob(jobInfo *JobInfo) (string, chan string, chan s
     jm.stats[id] = &JobStats{
         UpdateTime: time.Now(),
     }
+    jm.active[id] = true
     jm.mu.Unlock()
     
     return id, logCh, stopCh
@@ -131,7 +135,7 @@ func (jm *JobManager) GetJobInfo(id string) (*JobInfo, bool) {
     return info, ok
 }
 
-// Update job status
+// Update job status and notify
 func (jm *JobManager) UpdateJobStatus(id string, status JobStatus) bool {
     jm.mu.Lock()
     defer jm.mu.Unlock()
@@ -141,7 +145,24 @@ func (jm *JobManager) UpdateJobStatus(id string, status JobStatus) bool {
         return false
     }
     
+    // Update status
     info.Status = status
+    
+    // Notify through the log channel if possible
+    if logCh, ok := jm.jobs[id]; ok {
+        select {
+        case logCh <- fmt.Sprintf("\n⚠️ SERVICE STATUS: %s\n", status):
+            // Message sent
+        default:
+            // Channel full or closed
+        }
+    }
+    
+    // If job is complete or error, mark it as inactive
+    if status == StatusComplete || status == StatusError {
+        jm.active[id] = false
+    }
+    
     return true
 }
 
@@ -191,44 +212,83 @@ func (jm *JobManager) RemoveJob(id string) {
     if info, ok := jm.info[id]; ok {
         info.Status = StatusComplete
     }
+    jm.active[id] = false
     jm.mu.Unlock()
 }
 
 // StopAllJobs stops all running jobs
 func (jm *JobManager) StopAllJobs() int {
     jm.mu.RLock()
-    stops := make([]chan struct{}, 0, len(jm.stops))
-    ids := make([]string, 0, len(jm.stops))
-    for id, stopCh := range jm.stops {
-        stops = append(stops, stopCh)
-        ids = append(ids, id)
+    activeJobs := make([]string, 0)
+    for id, active := range jm.active {
+        if active {
+            activeJobs = append(activeJobs, id)
+        }
     }
     jm.mu.RUnlock()
     
     count := 0
-    for i, stopCh := range stops {
-        select {
-        case stopCh <- struct{}{}:
-            jm.UpdateJobStatus(ids[i], StatusStopping)
-            count++
-        default:
-            // Channel already closed or full
+    // First update all statuses to stopping
+    for _, id := range activeJobs {
+        jm.UpdateJobStatus(id, StatusStopping)
+    }
+    
+    // Signal all stop channels
+    for _, id := range activeJobs {
+        if stopCh, ok := jm.GetStop(id); ok {
+            select {
+            case stopCh <- struct{}{}:
+                count++
+            default:
+                // Channel already closed or full
+            }
         }
     }
     
-    // Create stop file to signal connector
-    f, err := os.Create(".stop-runner")
-    if err == nil {
-        f.Close()
-    }
+    // Create stop files in multiple locations for redundancy
+    createStopFiles()
     
     return count
 }
 
-// removeStopFile removes the stop file if it exists
-func removeStopFile() {
-    if _, err := os.Stat(".stop-runner"); err == nil {
-        os.Remove(".stop-runner")
+// Create stop files in multiple locations
+func createStopFiles() {
+    stopFiles := []string{
+        filepath.Join(".", ".stop-runner"),
+        filepath.Join(".", ".stop"),
+        filepath.Join("data", ".stop"),
+    }
+    
+    // Try to create /tmp/enidu.stop if possible
+    if tmpDir := os.TempDir(); tmpDir != "" {
+        stopFiles = append(stopFiles, filepath.Join(tmpDir, "enidu.stop"))
+    }
+    
+    for _, path := range stopFiles {
+        f, err := os.Create(path)
+        if err == nil {
+            f.Close()
+        }
+    }
+}
+
+// Remove all stop files
+func removeStopFiles() {
+    stopFiles := []string{
+        filepath.Join(".", ".stop-runner"),
+        filepath.Join(".", ".stop"),
+        filepath.Join("data", ".stop"),
+    }
+    
+    // Try to remove /tmp/enidu.stop if possible
+    if tmpDir := os.TempDir(); tmpDir != "" {
+        stopFiles = append(stopFiles, filepath.Join(tmpDir, "enidu.stop"))
+    }
+    
+    for _, path := range stopFiles {
+        if _, err := os.Stat(path); err == nil {
+            os.Remove(path)
+        }
     }
 }
 
@@ -263,6 +323,9 @@ func StartWebServer() {
     // Create data directory if it doesn't exist
     os.MkdirAll("data", 0755)
     
+    // Clear any existing stop files on startup
+    removeStopFiles()
+    
     app := fiber.New(fiber.Config{
         ReadTimeout:  10 * time.Second,
         WriteTimeout: 10 * time.Second,
@@ -290,7 +353,7 @@ func StartWebServer() {
     // Create endpoint: starts a job and returns the job info and ws URL
     api.Post("/jobs", func(c *fiber.Ctx) error {
         // Remove any existing stop file
-        removeStopFile()
+        removeStopFiles()
 
         // Parse request body or query parameters
         type CreateRequest struct {
@@ -368,6 +431,11 @@ func StartWebServer() {
             // Process log messages for stats extraction
             go func() {
                 for msg := range logCh {
+                    // Check for SERVICE STOPPING messages
+                    if strings.Contains(msg, "SERVICE STOPPING") {
+                        manager.UpdateJobStatus(id, StatusStopping)
+                    }
+                    
                     // Try to parse stats from the log message
                     if stats := parseStatLine(msg); stats != nil {
                         manager.UpdateJobStats(id, stats)
@@ -377,11 +445,18 @@ func StartWebServer() {
             
             select {
             case <-stopCh:
-                fmt.Fprintf(writer, "Job %s stopped by user request.\n", id)
+                fmt.Fprintf(writer, "⚠️ SERVICE STOPPING: Job %s stopped by user request.\n", id)
                 manager.UpdateJobStatus(id, StatusStopping)
+                
+                // Create stop files
+                createStopFiles()
+                
             case <-done:
-                fmt.Fprintf(writer, "Job %s completed.\n", id)
+                fmt.Fprintf(writer, "✅ SERVICE COMPLETE: Job %s finished execution.\n", id)
                 manager.UpdateJobStatus(id, StatusComplete)
+                
+                // Make sure any stop files are cleaned up
+                removeStopFiles()
             }
             
             // Wait a moment to allow logs to flush
@@ -424,8 +499,17 @@ func StartWebServer() {
     // Stop job endpoint
     api.Delete("/jobs/:id", func(c *fiber.Ctx) error {
         id := c.Params("id")
-        stopCh, ok := manager.GetStop(id)
         
+        // Update job status first
+        if !manager.UpdateJobStatus(id, StatusStopping) {
+            return c.Status(404).JSON(fiber.Map{
+                "error": "Job not found or already stopped",
+                "code":  "JOB_NOT_FOUND",
+            })
+        }
+        
+        // Get stop channel
+        stopCh, ok := manager.GetStop(id)
         if !ok {
             return c.Status(404).JSON(fiber.Map{
                 "error": "Job not found or already stopped",
@@ -436,16 +520,13 @@ func StartWebServer() {
         // Signal stop
         select {
         case stopCh <- struct{}{}:
-            manager.UpdateJobStatus(id, StatusStopping)
+            // Successfully sent stop signal
         default:
             // Channel might be full or closed
         }
         
-        // Create .stop-runner file
-        f, err := os.Create(".stop-runner")
-        if err == nil {
-            f.Close()
-        }
+        // Create stop files - be redundant to ensure the process sees it
+        createStopFiles()
         
         return c.JSON(fiber.Map{
             "status": "stopping",
@@ -491,6 +572,16 @@ func StartWebServer() {
         
         // Listen for messages
         for msg := range logCh {
+            // Check for status updates
+            if strings.Contains(msg, "SERVICE STOPPING") {
+                // Send special status notification
+                c.WriteJSON(fiber.Map{
+                    "type": "status",
+                    "data": "stopping",
+                    "ts":   time.Now().Unix(),
+                })
+            }
+            
             err := c.WriteJSON(fiber.Map{
                 "type": "log",
                 "data": msg,

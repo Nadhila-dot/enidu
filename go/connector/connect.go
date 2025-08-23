@@ -158,20 +158,31 @@ func HttpTester(targetURL, proxyAddr string, concurrency int, timeoutSec int64, 
     // Set up a dedicated stop file watcher with frequent polling
     stopChan := make(chan struct{})
     go func() {
+        // Check multiple stop file paths for better reliability
+        stopFiles := []string{
+            filepath.Join(".", ".stop-runner"),
+            filepath.Join(".", ".stop"),
+            filepath.Join("data", ".stop"),
+            filepath.Join("/tmp", "enidu.stop"),
+        }
+        
         ticker := time.NewTicker(100 * time.Millisecond) // Check every 100ms
         defer ticker.Stop()
         
         for {
             select {
             case <-ticker.C:
-                if shouldStop() {
-                    fmt.Fprintf(printfWriter, "\n.stop-runner detected, initiating shutdown...\n")
-                    atomic.StoreInt32(&stopFlag, 1)
-                    close(stopChan)
-                    return
+                // Check all possible stop file locations
+                for _, path := range stopFiles {
+                    if _, err := os.Stat(path); err == nil {
+                        fmt.Fprintf(printfWriter, "\n⚠️ STOP FILE DETECTED: %s - SHUTTING DOWN\n", path)
+                        atomic.StoreInt32(&stopFlag, 1)
+                        close(stopChan)
+                        return
+                    }
                 }
             case <-sig:
-                fmt.Fprintf(printfWriter, "\nInterrupt signal detected, initiating shutdown...\n")
+                fmt.Fprintf(printfWriter, "\n⚠️ INTERRUPT SIGNAL DETECTED - SHUTTING DOWN\n")
                 atomic.StoreInt32(&stopFlag, 1)
                 close(stopChan)
                 return
@@ -198,6 +209,7 @@ func HttpTester(targetURL, proxyAddr string, concurrency int, timeoutSec int64, 
         
         for {
             if atomic.LoadInt32(&stopFlag) == 1 {
+                fmt.Fprintf(printfWriter, "\n⚠️ SERVICE STOPPING: Shutting down stats printer\n")
                 return
             }
             
@@ -241,9 +253,6 @@ func HttpTester(targetURL, proxyAddr string, concurrency int, timeoutSec int64, 
             return make([]byte, 8192) // Larger buffer for efficiency
         },
     }
-
-    // Seed the random number generator
-    // (No need to call rand.Seed globally as of Go 1.20)
 
     // Launch workers with improved logic
     var wg sync.WaitGroup
@@ -395,6 +404,7 @@ func HttpTester(targetURL, proxyAddr string, concurrency int, timeoutSec int64, 
 
     // Signal all workers to stop
     atomic.StoreInt32(&stopFlag, 1)
+    fmt.Fprintf(printfWriter, "\n⚠️ SERVICE STOPPING: Signal received, shutting down all workers...\n")
     
     // Wait for all workers with a timeout
     waitChan := make(chan struct{})
@@ -406,9 +416,9 @@ func HttpTester(targetURL, proxyAddr string, concurrency int, timeoutSec int64, 
     // Give workers up to 5 seconds to gracefully exit
     select {
     case <-waitChan:
-        fmt.Fprintf(printfWriter, "\nAll workers exited gracefully\n")
+        fmt.Fprintf(printfWriter, "\n✅ SERVICE STOPPING: All workers exited gracefully\n")
     case <-time.After(5 * time.Second):
-        fmt.Fprintf(printfWriter, "\nForcing shutdown after timeout\n")
+        fmt.Fprintf(printfWriter, "\n⚠️ SERVICE STOPPING: Forcing shutdown after timeout\n")
     }
 
     // Print final stats
@@ -419,6 +429,9 @@ func HttpTester(targetURL, proxyAddr string, concurrency int, timeoutSec int64, 
 
     // Close error channel
     close(errorChan)
+    
+    // Clean up all stop files
+    cleanupStopFiles()
 }
 
 // Helper to check if an error is a connection-related error
@@ -434,8 +447,37 @@ func isConnectionError(err error) bool {
            strings.Contains(errStr, "i/o timeout")
 }
 
+// Check for stop files in multiple locations
 func shouldStop() bool {
-    // Looks for .stop-runner in the current working directory
-    _, err := os.Stat(filepath.Join(".", ".stop-runner"))
-    return err == nil
+    // Check multiple potential stop file locations
+    stopFiles := []string{
+        filepath.Join(".", ".stop-runner"),
+        filepath.Join(".", ".stop"),
+        filepath.Join("data", ".stop"),
+        filepath.Join("/tmp", "enidu.stop"),
+    }
+    
+    for _, path := range stopFiles {
+        if _, err := os.Stat(path); err == nil {
+            return true
+        }
+    }
+    
+    return false
+}
+
+// Clean up all stop files
+func cleanupStopFiles() {
+    stopFiles := []string{
+        filepath.Join(".", ".stop-runner"),
+        filepath.Join(".", ".stop"),
+        filepath.Join("data", ".stop"),
+        filepath.Join("/tmp", "enidu.stop"),
+    }
+    
+    for _, path := range stopFiles {
+        if _, err := os.Stat(path); err == nil {
+            os.Remove(path)
+        }
+    }
 }

@@ -9,6 +9,8 @@ import (
 )
 
 func main() {
+    //We will use this id later for authentication
+    //but for now nahhh
     id, err := config.GenerateOrLoadInstanceID()
     if err != nil {
         log.Fatalf("Error generating or loading instance ID: %v", err)

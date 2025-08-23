@@ -1,15 +1,13 @@
+# Enidu 
+A powerful tool for something
 The main executable will be made w/ go. 
 
 Python && javascript are just adapters to run the GO executable
 
 
-Here's an improved version of your router API with better structure, error handling, and additional features:
-
 
 ```markdown
-# Enidu Stress Test API
 
-Enidu is a high-performance HTTP load testing tool designed to stress test web applications and services.
 
 ## API Documentation
 
@@ -334,28 +332,6 @@ async function stopStressTest(id) {
 ## Rate Limits
 
 There are currently no rate limits imposed on the API.
+This api is made to handle over 100 requests at the same time. 
 ```
 
-This improved API adds:
-
-1. Proper RESTful API design with versioning
-2. Better error handling and validation
-3. Job tracking with statistics
-4. WebSocket message typing for different message categories
-5. Comprehensive documentation with examples
-6. Support for both query parameters and JSON body
-7. API consistency through standardized responses
-
-Let me know if you'd like any adjustments or have any questions!This improved API adds:
-
-1. Proper RESTful API design with versioning
-2. Better error handling and validation
-3. Job tracking with statistics
-4. WebSocket message typing for different message categories
-5. Comprehensive documentation with examples
-6. Support for both query parameters and JSON body
-7. API consistency through standardized responses
-
-Let me know if you'd like any adjustments or have any questions!
-
-Similar code found with 1 license type

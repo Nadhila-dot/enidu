@@ -1,8 +1,8 @@
-[!NOTE]
-Enidu is not support on windows, it's currently only avaiable on Macos and linux. Use WSL to run enidu on windows.
+>[!NOTE]
+>Enidu is not support on windows, it's currently only avaiable on Macos and linux. Use WSL to run enidu on windows.
 
-[!CAUTION]
-Enidu was made for educational purposes. DO NOT USE IN PRODUCTION!
+>[!CAUTION]
+>Enidu was made for educational purposes. DO NOT USE IN PRODUCTION!
 
 
 ## API Documentation

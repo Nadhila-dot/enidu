@@ -1,12 +1,8 @@
-# Enidu 
-A powerful tool for something
+[!NOTE]
+Enidu is not support on windows, it's currently only avaiable on Macos and linux. Use WSL to run enidu on windows.
 
-
-Enidu is a nadhi.dev product. 
-
-
-
-
+[!CAUTION]
+Enidu was made for educational purposes. DO NOT USE IN PRODUCTION!
 
 
 ## API Documentation

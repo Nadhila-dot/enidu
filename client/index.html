@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Enidu Stress Test Client</title>
+  <style>
+    body {
+      font-family: monospace;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    h1 {
+      border-bottom: 1px solid #000;
+      padding-bottom: 10px;
+    }
+    fieldset {
+      margin-bottom: 20px;
+      border: 1px solid #000;
+    }
+    label {
+      display: block;
+      margin: 10px 0 5px;
+    }
+    input, button {
+      font-family: monospace;
+      padding: 5px;
+    }
+    button {
+      cursor: pointer;
+      margin: 5px 0;
+    }
+    #log {
+      height: 400px;
+      overflow-y: auto;
+      border: 1px solid #000;
+      padding: 10px;
+      background-color: #f9f9f9;
+      white-space: pre-wrap;
+    }
+    #activeJobs {
+      margin-top: 20px;
+      border: 1px solid #000;
+      padding: 10px;
+    }
+    .job {
+      padding: 5px;
+      margin-bottom: 5px;
+      border-bottom: 1px solid #ccc;
+      cursor: pointer;
+    }
+    .job:hover {
+      background-color: #eee;
+    }
+    .running {
+      border-left: 5px solid #000;
+      padding-left: 5px;
+    }
+    .stopping {
+      border-left: 5px solid #888;
+      padding-left: 5px;
+    }
+    .complete {
+      border-left: 5px solid #ccc;
+      padding-left: 5px;
+    }
+    #statusBar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: #000;
+      color: #fff;
+      padding: 5px 10px;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Enidu Stress Test Client</h1>
+  
+  <fieldset>
+    <legend>Instance Configuration</legend>
+    <label for="instanceUrl">Instance URL:</label>
+    <input type="url" id="instanceUrl" placeholder="http://localhost:3171" style="width: 300px;">
+    <button id="saveInstance">Save</button>
+    <button id="checkInstance">Check Status</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Test Configuration</legend>
+    <label for="targetUrl">Target URL:</label>
+    <input type="url" id="targetUrl" placeholder="https://example.com" style="width: 300px;">
+    
+    <label for="concurrency">Concurrency:</label>
+    <input type="number" id="concurrency" value="100" min="1" max="10000">
+    
+    <label for="timeoutSec">Timeout (seconds):</label>
+    <input type="number" id="timeoutSec" value="10" min="1" max="60">
+    
+    <label for="waitMs">Wait (ms):</label>
+    <input type="number" id="waitMs" value="0" min="0" max="1000">
+    
+    <label for="randomHeaders">
+      <input type="checkbox" id="randomHeaders"> Use random headers
+    </label>
+    
+    <button id="startTest">Start Test</button>
+    <button id="stopTest" disabled>Stop Test</button>
+    <button id="stopAllTests">Stop All Tests</button>
+  </fieldset>
+
+  <h2>Test Output</h2>
+  <div id="log">Waiting for test to start...</div>
+  
+  <h2>Active Jobs</h2>
+  <div id="activeJobs">No active jobs</div>
+
+  <div id="statusBar">Not connected</div>
+
+  <script>
+    // DOM Elements
+    const instanceUrlEl = document.getElementById('instanceUrl');
+    const saveInstanceBtn = document.getElementById('saveInstance');
+    const checkInstanceBtn = document.getElementById('checkInstance');
+    const targetUrlEl = document.getElementById('targetUrl');
+    const concurrencyEl = document.getElementById('concurrency');
+    const timeoutSecEl = document.getElementById('timeoutSec');
+    const waitMsEl = document.getElementById('waitMs');
+    const randomHeadersEl = document.getElementById('randomHeaders');
+    const startTestBtn = document.getElementById('startTest');
+    const stopTestBtn = document.getElementById('stopTest');
+    const stopAllTestsBtn = document.getElementById('stopAllTests');
+    const logEl = document.getElementById('log');
+    const activeJobsEl = document.getElementById('activeJobs');
+    const statusBarEl = document.getElementById('statusBar');
+
+    // State
+    let currentSocket = null;
+    let currentJobId = null;
+    let jobRefreshInterval = null;
+
+    // Load instance URL from localStorage
+    instanceUrlEl.value = localStorage.getItem('enidu_instance_url') || '';
+
+    // Save instance URL to localStorage
+    saveInstanceBtn.addEventListener('click', () => {
+      localStorage.setItem('enidu_instance_url', instanceUrlEl.value);
+      updateStatus(`Instance URL saved: ${instanceUrlEl.value}`);
+    });
+
+    // Check instance status
+    checkInstanceBtn.addEventListener('click', async () => {
+      const instanceUrl = getInstanceUrl();
+      if (!instanceUrl) return;
+
+      try {
+        updateStatus('Checking instance status...');
+        const response = await fetch(`${instanceUrl}/api/v1/`);
+        const data = await response.json();
+        updateStatus(`Instance status: ${data.message} (${data.version})`);
+        
+        // Refresh job list
+        fetchJobs();
+      } catch (error) {
+        updateStatus(`Error connecting to instance: ${error.message}`);
+      }
+    });
+
+    // Start test
+    startTestBtn.addEventListener('click', async () => {
+      const instanceUrl = getInstanceUrl();
+      if (!instanceUrl) return;
+      
+      const targetUrl = targetUrlEl.value;
+      if (!targetUrl) {
+        updateStatus('Error: Target URL is required');
+        return;
+      }
+      
+      try {
+        updateStatus('Starting test...');
+        logEl.textContent = 'Initializing test...\n';
+        
+        const response = await fetch(`${instanceUrl}/api/v1/jobs`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            url: targetUrl,
+            concurrency: parseInt(concurrencyEl.value),
+            timeoutSec: parseInt(timeoutSecEl.value),
+            waitMs: parseInt(waitMsEl.value),
+            randomHeaders: randomHeadersEl.checked
+          })
+        });
+        
+        const data = await response.json();
+        currentJobId = data.id;
+        updateStatus(`Test started with job ID: ${data.id}`);
+        logEl.textContent += `Test started with job ID: ${data.id}\n`;
+        stopTestBtn.disabled = false;
+        
+        // Connect to WebSocket
+        connectToWebSocket(instanceUrl, data.wsUrl);
+        
+        // Refresh job list
+        fetchJobs();
+      } catch (error) {
+        updateStatus(`Error starting test: ${error.message}`);
+        logEl.textContent += `Error: ${error.message}\n`;
+      }
+    });
+
+    // Stop test
+    stopTestBtn.addEventListener('click', async () => {
+      if (!currentJobId) return;
+      
+      const instanceUrl = getInstanceUrl();
+      if (!instanceUrl) return;
+      
+      try {
+        updateStatus(`Stopping job ${currentJobId}...`);
+        
+        const response = await fetch(`${instanceUrl}/api/v1/jobs/${currentJobId}`, {
+          method: 'DELETE'
+        });
+        
+        const data = await response.json();
+        updateStatus(`Job ${currentJobId} status: ${data.status}`);
+        logEl.textContent += `\nTest stopping: ${data.status}\n`;
+        
+        // Don't disable button yet, wait for completion in WebSocket
+        
+        // Refresh job list
+        fetchJobs();
+      } catch (error) {
+        updateStatus(`Error stopping test: ${error.message}`);
+        logEl.textContent += `\nError stopping test: ${error.message}\n`;
+      }
+    });
+
+    // Stop all tests
+    stopAllTestsBtn.addEventListener('click', async () => {
+      const instanceUrl = getInstanceUrl();
+      if (!instanceUrl) return;
+      
+      try {
+        updateStatus('Stopping all jobs...');
+        
+        const response = await fetch(`${instanceUrl}/api/v1/jobs`, {
+          method: 'DELETE'
+        });
+        
+        const data = await response.json();
+        updateStatus(`Stopped ${data.count} job(s)`);
+        logEl.textContent += `\nStopped ${data.count} job(s)\n`;
+        
+        // Refresh job list
+        fetchJobs();
+      } catch (error) {
+        updateStatus(`Error stopping all tests: ${error.message}`);
+        logEl.textContent += `\nError stopping all tests: ${error.message}\n`;
+      }
+    });
+
+    // Connect to WebSocket
+    function connectToWebSocket(instanceUrl, wsUrl) {
+      // Close existing socket if any
+      if (currentSocket) {
+        currentSocket.close();
+      }
+      
+      // Create WebSocket URL - handle both absolute and relative paths
+      let fullWsUrl;
+      if (wsUrl.startsWith('ws://') || wsUrl.startsWith('wss://')) {
+        fullWsUrl = wsUrl;
+      } else {
+        // Convert http:// to ws:// or https:// to wss://
+        const wsProtocol = instanceUrl.startsWith('https') ? 'wss://' : 'ws://';
+        const urlWithoutProtocol = instanceUrl.replace(/^https?:\/\//, '');
+        fullWsUrl = wsProtocol + urlWithoutProtocol + wsUrl;
+      }
+      
+      updateStatus(`Connecting to WebSocket: ${fullWsUrl}`);
+      
+      currentSocket = new WebSocket(fullWsUrl);
+      
+      currentSocket.onopen = () => {
+        updateStatus(`WebSocket connected for job: ${currentJobId}`);
+        logEl.textContent += 'WebSocket connected, waiting for data...\n\n';
+      };
+      
+      currentSocket.onmessage = (event) => {
+        const message = JSON.parse(event.data);
+        
+        if (message.type === 'info') {
+          logEl.textContent += `Job Info: ${JSON.stringify(message.data, null, 2)}\n\n`;
+        } else if (message.type === 'log') {
+          logEl.textContent += `${message.data}\n`;
+          logEl.scrollTop = logEl.scrollHeight; // Auto-scroll to bottom
+        } else {
+          // Legacy format support
+          if (message.log) {
+            logEl.textContent += `${message.log}\n`;
+            logEl.scrollTop = logEl.scrollHeight;
+          }
+        }
+      };
+      
+      currentSocket.onclose = () => {
+        updateStatus('WebSocket disconnected');
+        
+        // Check if test is complete
+        if (currentJobId) {
+          fetchJobStatus(currentJobId);
+        }
+      };
+      
+      currentSocket.onerror = (error) => {
+        updateStatus('WebSocket error');
+        logEl.textContent += `\nWebSocket error: ${error}\n`;
+      };
+    }
+
+    // Fetch all jobs
+    async function fetchJobs() {
+      const instanceUrl = getInstanceUrl();
+      if (!instanceUrl) return;
+      
+      try {
+        const response = await fetch(`${instanceUrl}/api/v1/jobs`);
+        const data = await response.json();
+        
+        if (data.jobs && data.jobs.length > 0) {
+          activeJobsEl.innerHTML = '';
+          data.jobs.forEach(job => {
+            const jobEl = document.createElement('div');
+            jobEl.className = `job ${job.status}`;
+            
+            const statsText = job.stats ? 
+              `| Sent: ${job.stats.sent} | Success: ${job.stats.success} | Errors: ${job.stats.errors}` :
+              '';
+            
+            jobEl.innerHTML = `
+              <strong>${job.id}</strong> - ${job.url} 
+              (${job.concurrency} conn, ${job.status}) ${statsText}
+            `;
+            
+            jobEl.addEventListener('click', () => {
+              // Select this job
+              currentJobId = job.id;
+              updateStatus(`Selected job: ${job.id}`);
+              
+              // Enable/disable stop button based on status
+              stopTestBtn.disabled = (job.status !== 'running');
+              
+              // Connect to WebSocket for this job
+              const wsUrl = `/api/v1/ws/${job.id}`;
+              connectToWebSocket(instanceUrl, wsUrl);
+            });
+            
+            activeJobsEl.appendChild(jobEl);
+          });
+        } else {
+          activeJobsEl.innerHTML = 'No active jobs';
+        }
+      } catch (error) {
+        updateStatus(`Error fetching jobs: ${error.message}`);
+      }
+    }
+
+    // Fetch job status
+    async function fetchJobStatus(jobId) {
+      const instanceUrl = getInstanceUrl();
+      if (!instanceUrl || !jobId) return;
+      
+      try {
+        const response = await fetch(`${instanceUrl}/api/v1/jobs/${jobId}`);
+        
+        if (response.status === 404) {
+          updateStatus(`Job ${jobId} not found (completed)`);
+          stopTestBtn.disabled = true;
+          currentJobId = null;
+          return;
+        }
+        
+        const job = await response.json();
+        
+        if (job.status === 'complete' || job.status === 'error') {
+          updateStatus(`Job ${jobId} is ${job.status}`);
+          stopTestBtn.disabled = true;
+          currentJobId = null;
+        }
+      } catch (error) {
+        updateStatus(`Error fetching job status: ${error.message}`);
+      }
+    }
+
+    // Update status
+    function updateStatus(message) {
+      statusBarEl.textContent = message;
+      console.log(message);
+    }
+
+    // Get instance URL with validation
+    function getInstanceUrl() {
+      const url = instanceUrlEl.value.trim();
+      if (!url) {
+        updateStatus('Error: Instance URL is required');
+        return null;
+      }
+      return url;
+    }
+
+    // Setup periodic job refresh
+    function setupJobRefresh() {
+      // Clear existing interval if any
+      if (jobRefreshInterval) {
+        clearInterval(jobRefreshInterval);
+      }
+      
+      // Refresh jobs list every 5 seconds
+      jobRefreshInterval = setInterval(fetchJobs, 5000);
+    }
+
+    // Initialize
+    document.addEventListener('DOMContentLoaded', () => {
+      // Check if instance URL is saved
+      if (instanceUrlEl.value) {
+        updateStatus(`Using instance: ${instanceUrlEl.value}`);
+        fetchJobs();
+        setupJobRefresh();
+      } else {
+        updateStatus('Please enter and save an instance URL');
+      }
+    });
+  </script>
+</body>
+</html>

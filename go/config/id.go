@@ -9,6 +9,7 @@ import (
 
 // GenerateOrLoadInstanceID generates a unique identifier for this instance and saves/loads it from disk.
 // The ID is stored in $HOME/.enidu_instance_id and will persist across reboots unless deleted manually.
+// ikr
 func GenerateOrLoadInstanceID() (string, error) {
     home, err := os.UserHomeDir()
     if err != nil {

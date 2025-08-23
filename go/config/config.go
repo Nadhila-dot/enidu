@@ -9,6 +9,7 @@ import (
 // ReadTypes reads the "types.txt" file in the current directory.
 // If the file does not exist, it creates it and returns an empty slice.
 // It returns a slice of website URLs (split by comma).
+//cool
 func ReadTypes() ([]string, error) {
     filename := "types.txt"
 

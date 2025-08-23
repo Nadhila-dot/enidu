@@ -1,8 +1,8 @@
 # Enidu 
 A powerful tool for something
-The main executable will be made w/ go. 
 
-Python && javascript are just adapters to run the GO executable
+
+Enidu is a nadhi.dev product. 
 
 
 

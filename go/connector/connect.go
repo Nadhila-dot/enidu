@@ -436,21 +436,16 @@ func HttpTester(targetURL, proxyAddr string, concurrency int, timeoutSec int64, 
 }
 
 // HttpTesterWithContext: EXTREME THROUGHPUT MODE WITH CONTEXT
-func HttpTesterWithContext(
-    ctx context.Context,
-    targetURL string, 
-    proxyAddr string, 
-    concurrency int, 
-    timeoutSec int64, 
-    waitMs int, 
-    randomHeaders bool,
-) {
+func HttpTesterWithContext(ctx context.Context, targetURL, proxyAddr string, concurrency int, timeoutSec int64, waitMs int, randomHeaders bool) {
     // Reset stop flag at the beginning
     atomic.StoreInt32(&stopFlag, 0)
     
     var sent, success, errors, timeouts, connErrors int64
     var mu sync.Mutex
-    errorChan := make(chan string, 10000) // Increased buffer for error messages
+    errorChan := make(chan string, 10000) // Keep large buffer for error messages
+    
+    // Save original GOMAXPROCS to restore on shutdown
+    originalProcs := runtime.GOMAXPROCS(0)
     
     // Allow GC to be more aggressive when needed
     debug.SetGCPercent(20)
@@ -459,46 +454,45 @@ func HttpTesterWithContext(
     sig := make(chan os.Signal, 1)
     signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
-    // Maximize CPU usage
-    runtime.GOMAXPROCS(runtime.NumCPU() * 2) // Push even harder by allowing CPU oversubscription
+    // Maximize CPU usage for high throughput
+    runtime.GOMAXPROCS(runtime.NumCPU() * 2)
 
     // Prepare URL
     parsedURL, _ := url.Parse(targetURL)
     host := parsedURL.Host
 
     // Create hyper-optimized transport with enormous connection pool
+    // but safer values to avoid panics
     dialer := &net.Dialer{
-        Timeout:   2 * time.Second,     // Faster timeout for quicker retries
-        KeepAlive: 60 * time.Second,    // Longer keepalives
-        DualStack: true,                // Enable IPv4/IPv6
+        Timeout:   2 * time.Second,
+        KeepAlive: 60 * time.Second,
+        DualStack: true,
         Control: func(network, address string, c syscall.RawConn) error {
             return c.Control(func(fd uintptr) {
-                // Set socket options for maximum throughput
                 syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1)
                 syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY, 1)
-                // Set large socket buffers
                 syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 1048576)
                 syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 1048576)
             })
         },
     }
 
+    // Use safer but still high connection limits
     transport := &http.Transport{
         Proxy:                 http.ProxyFromEnvironment,
         DialContext:           dialer.DialContext,
-        MaxIdleConns:          5000000,            // Massively increased
-        MaxIdleConnsPerHost:   5000000,            // Massively increased
-        MaxConnsPerHost:       5000000,            // Massively increased
+        MaxIdleConns:          500000,            // High but not extreme
+        MaxIdleConnsPerHost:   500000,            // High but not extreme
+        MaxConnsPerHost:       500000,            // High but not extreme
         IdleConnTimeout:       90 * time.Second,
         DisableKeepAlives:     false,
-        ForceAttemptHTTP2:     false,             // Disable HTTP/2 for more raw throughput
-        DisableCompression:    true,              // Disable compression for speed
-        TLSHandshakeTimeout:   3 * time.Second,   // Faster TLS handshake
+        ForceAttemptHTTP2:     false,
+        DisableCompression:    true,
+        TLSHandshakeTimeout:   3 * time.Second,
         ExpectContinueTimeout: 1 * time.Second,
         ResponseHeaderTimeout: time.Duration(timeoutSec) * time.Second,
-
-        ReadBufferSize:        1024 * 1024,       // 1MB read buffer
-        WriteBufferSize:       1024 * 1024,       // 1MB write buffer
+        ReadBufferSize:        1024 * 1024,
+        WriteBufferSize:       1024 * 1024,
     }
 
     if proxyAddr != "" {
@@ -506,32 +500,33 @@ func HttpTesterWithContext(
         transport.Proxy = http.ProxyURL(proxyURL)
     }
 
-    // Create even more HTTP clients for better parallelism
-    numClients := runtime.NumCPU() * 8 // Double from previous
+    // Create multiple HTTP clients for better parallelism
+    numClients := runtime.NumCPU() * 8
     clients := make([]*http.Client, numClients)
     for i := 0; i < numClients; i++ {
         clients[i] = &http.Client{
             Transport: transport,
             Timeout:   time.Duration(timeoutSec) * time.Second,
             CheckRedirect: func(req *http.Request, via []*http.Request) error {
-                return http.ErrUseLastResponse // Don't follow redirects
+                return http.ErrUseLastResponse
             },
         }
     }
 
+    // Create a cancellable context from the parent context
+    ctxWithCancel, cancel := context.WithCancel(ctx)
+    defer cancel() // Ensure we cancel this context when we're done
+
     // Pre-build request template
     reqTemplate, _ := http.NewRequest("GET", targetURL, nil)
-    
-    // Basic headers that will be present in all requests
     reqTemplate.Header.Set("User-Agent", userAgents[0])
     reqTemplate.Header.Set("Connection", "keep-alive")
     reqTemplate.Header.Set("Host", host)
     reqTemplate.Header.Set("Accept", "*/*")
     
-    // Set up a dedicated stop file watcher with frequent polling
+    // Set up stop file watcher
     stopChan := make(chan struct{})
     go func() {
-        // Check multiple stop file paths for better reliability
         stopFiles := []string{
             filepath.Join(".", ".stop-runner"),
             filepath.Join(".", ".stop"),
@@ -539,17 +534,18 @@ func HttpTesterWithContext(
             filepath.Join("/tmp", "enidu.stop"),
         }
         
-        ticker := time.NewTicker(100 * time.Millisecond) // Check every 100ms
+        ticker := time.NewTicker(100 * time.Millisecond)
         defer ticker.Stop()
         
         for {
             select {
             case <-ticker.C:
-                // Check all possible stop file locations
                 for _, path := range stopFiles {
                     if _, err := os.Stat(path); err == nil {
                         fmt.Fprintf(printfWriter, "\n⚠️ STOP FILE DETECTED: %s - SHUTTING DOWN\n", path)
                         atomic.StoreInt32(&stopFlag, 1)
+                        // Cancel context to abort in-flight requests
+                        cancel()
                         close(stopChan)
                         return
                     }
@@ -557,6 +553,15 @@ func HttpTesterWithContext(
             case <-sig:
                 fmt.Fprintf(printfWriter, "\n⚠️ INTERRUPT SIGNAL DETECTED - SHUTTING DOWN\n")
                 atomic.StoreInt32(&stopFlag, 1)
+                // Cancel context to abort in-flight requests
+                cancel()
+                close(stopChan)
+                return
+            case <-ctx.Done():
+                fmt.Fprintf(printfWriter, "\n⚠️ PARENT CONTEXT CANCELED - SHUTTING DOWN\n")
+                atomic.StoreInt32(&stopFlag, 1)
+                // Cancel our context to abort in-flight requests
+                cancel()
                 close(stopChan)
                 return
             }
@@ -564,55 +569,78 @@ func HttpTesterWithContext(
     }()
 
     // Error printer goroutine
+    errPrinterDone := make(chan struct{})
     go func() {
-        for err := range errorChan {
-            if atomic.LoadInt32(&stopFlag) == 1 {
-                continue // Skip printing errors during shutdown
+        defer close(errPrinterDone)
+        for {
+            select {
+            case err, ok := <-errorChan:
+                if !ok {
+                    return
+                }
+                if atomic.LoadInt32(&stopFlag) == 1 {
+                    continue // Skip printing errors during shutdown
+                }
+                mu.Lock()
+                fmt.Fprintf(printfWriter, "\nERROR: %s", err)
+                mu.Unlock()
+            case <-ctxWithCancel.Done():
+                // Drain channel but don't process any more errors
+                go func() {
+                    for range errorChan {
+                        // Just drain
+                    }
+                }()
+                return
             }
-            mu.Lock()
-            fmt.Fprintf(printfWriter, "\nERROR: %s", err)
-            mu.Unlock()
         }
     }()
 
-    // Enhanced stats printer with more metrics
+    // Stats printer goroutine
+    statsDone := make(chan struct{})
     go func() {
+        defer close(statsDone)
         var lastSent, lastSuccess, lastErrors int64
         startTime := time.Now()
+        ticker := time.NewTicker(1 * time.Second)
+        defer ticker.Stop()
         
         for {
-            if atomic.LoadInt32(&stopFlag) == 1 {
-                fmt.Fprintf(printfWriter, "\n⚠️ SERVICE STOPPING: Shutting down stats printer\n")
+            select {
+            case <-ticker.C:
+                if atomic.LoadInt32(&stopFlag) == 1 {
+                    return
+                }
+                
+                curSent := atomic.LoadInt64(&sent)
+                curSuccess := atomic.LoadInt64(&success)
+                curErrors := atomic.LoadInt64(&errors)
+                curTimeouts := atomic.LoadInt64(&timeouts)
+                curConnErrors := atomic.LoadInt64(&connErrors)
+                
+                duration := time.Since(startTime).Seconds()
+                overallRPS := float64(curSent) / duration
+                
+                mu.Lock()
+                fmt.Fprintf(printfWriter, "\rRuntime: %.1fs | Reqs: %d (RPS: %d | Avg: %.1f) | Success: %d (%d/s) | Errors: %d (%d/s) | Timeouts: %d | ConnErrs: %d",
+                    duration,
+                    curSent, curSent-lastSent, overallRPS,
+                    curSuccess, curSuccess-lastSuccess,
+                    curErrors, curErrors-lastErrors,
+                    curTimeouts, curConnErrors)
+                mu.Unlock()
+
+                lastSent = curSent
+                lastSuccess = curSuccess
+                lastErrors = curErrors
+            case <-ctxWithCancel.Done():
                 return
             }
-            
-            time.Sleep(1 * time.Second)
-            curSent := atomic.LoadInt64(&sent)
-            curSuccess := atomic.LoadInt64(&success)
-            curErrors := atomic.LoadInt64(&errors)
-            curTimeouts := atomic.LoadInt64(&timeouts)
-            curConnErrors := atomic.LoadInt64(&connErrors)
-            
-            duration := time.Since(startTime).Seconds()
-            overallRPS := float64(curSent) / duration
-            
-            mu.Lock()
-            fmt.Fprintf(printfWriter, "\rRuntime: %.1fs | Reqs: %d (RPS: %d | Avg: %.1f) | Success: %d (%d/s) | Errors: %d (%d/s) | Timeouts: %d | ConnErrs: %d",
-                duration,
-                curSent, curSent-lastSent, overallRPS,
-                curSuccess, curSuccess-lastSuccess,
-                curErrors, curErrors-lastErrors,
-                curTimeouts, curConnErrors)
-            mu.Unlock()
-
-            lastSent = curSent
-            lastSuccess = curSuccess
-            lastErrors = curErrors
         }
     }()
 
     // Create MASSIVE worker pools
-    workersPerCPU := 10000 // 2x more than before
+    workersPerCPU := 5000 // Still high but more manageable
     totalWorkers := runtime.NumCPU() * workersPerCPU * concurrency
 
     fmt.Fprintf(printfWriter, "🚀 EXTREME MODE: Launching %d workers across %d CPUs against %s...\n",
@@ -623,16 +651,24 @@ func HttpTesterWithContext(
     // Pre-create worker buffers for read efficiency
     bufPool := sync.Pool{
         New: func() interface{} {
-            return make([]byte, 8192) // Larger buffer for efficiency
+            return make([]byte, 8192)
         },
     }
 
-    // Launch workers with improved logic
+    // Use a WaitGroup for worker synchronization
     var wg sync.WaitGroup
-    wg.Add(totalWorkers)
     
+    // Use a rate limiter to prevent too many goroutines starting at once
+    startSemaphore := make(chan struct{}, 5000)
+    
+    // Launch workers with connection-safe logic
     for i := 0; i < totalWorkers; i++ {
+        // Rate limit goroutine creation
+        startSemaphore <- struct{}{}
+        
+        wg.Add(1)
         go func(workerID int) {
+            <-startSemaphore // Release semaphore after getting ID
             defer wg.Done()
             
             // Each worker uses a client based on its ID for better distribution
@@ -643,155 +679,157 @@ func HttpTesterWithContext(
             // Create a local RNG for this worker to avoid contention
             localRand := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
 
-            // Custom retry and backoff logic
-            retryMax := 3
-            backoffBase := 50 * time.Millisecond
+            // Custom retry logic
+            retryMax := 2 // Lower retry to prevent connection issues
 
             for atomic.LoadInt32(&stopFlag) == 0 {
-                // Clone the template request for each use
-                req := reqTemplate.Clone(reqTemplate.Context())
+                // Check if context is cancelled before doing more work
+                select {
+                case <-ctxWithCancel.Done():
+                    return
+                default:
+                    // Continue with the request
+                }
                 
-                // Apply random headers if enabled
+                // Clone the template request and use our cancellable context
+                req := reqTemplate.Clone(ctxWithCancel)
+                
+                // Apply random headers if enabled (simplified for safety)
                 if randomHeaders {
-                    // Random user agent
                     req.Header.Set("User-Agent", userAgents[localRand.Intn(len(userAgents))])
-                    
-                    // Add random cache control
-                    cacheValues := []string{"no-cache", "max-age=0", "no-store", "must-revalidate"}
-                    req.Header.Set("Cache-Control", cacheValues[localRand.Intn(len(cacheValues))])
-                    
-                    // Random referer
-                    if localRand.Intn(10) > 2 { // 70% chance to include referer
+                    if localRand.Intn(10) > 2 {
                         req.Header.Set("Referer", referers[localRand.Intn(len(referers))])
                     }
-                    
-                    // Random accept-language
                     req.Header.Set("Accept-Language", acceptLanguages[localRand.Intn(len(acceptLanguages))])
-                    
-                    // Random client hints
-                    if localRand.Intn(10) > 5 {
-                        req.Header.Set("Sec-CH-UA", "\"Google Chrome\";v=\"115\", \"Chromium\";v=\"115\", \"Not:A-Brand\";v=\"99\"")
-                        req.Header.Set("Sec-CH-UA-Mobile", "?0")
-                        req.Header.Set("Sec-CH-UA-Platform", "\"Windows\"")
-                    }
-                    
-                    // Add custom X-headers with random values
-                    if localRand.Intn(10) > 7 { // 30% chance
-                        req.Header.Set(fmt.Sprintf("X-Custom-%d", localRand.Intn(999)), 
-                                        fmt.Sprintf("value-%d", localRand.Intn(99999)))
-                    }
-                    
-                    // Add various request timing headers
-                    if localRand.Intn(10) > 8 { // 20% chance
-                        req.Header.Set("Sec-Fetch-Dest", "document")
-                        req.Header.Set("Sec-Fetch-Mode", "navigate")
-                        req.Header.Set("Sec-Fetch-Site", "cross-site")
-                    }
                 }
 
-                // Wait delay if specified
+                // Wait delay if specified, with context cancellation check
                 if waitMs > 0 {
-                    jitter := float64(waitMs) * 0.2 // 20% jitter
-                    adjustedWait := waitMs + int(localRand.Float64()*jitter - jitter/2)
-                    if adjustedWait > 0 {
-                        time.Sleep(time.Duration(adjustedWait) * time.Millisecond)
+                    select {
+                    case <-ctxWithCancel.Done():
+                        return
+                    case <-time.After(time.Duration(waitMs) * time.Millisecond):
+                        // Continue after waiting
                     }
                 }
                 
-            // Retry logic with exponential backoff
-            var resp *http.Response
-            var err error
+                // Check again if we should stop before making the request
+                if atomic.LoadInt32(&stopFlag) == 1 {
+                    return
+                }
+                
+                // Safe request execution with retry
+                var resp *http.Response
+                var err error
                 
                 for retry := 0; retry < retryMax; retry++ {
-                    // Check stop flag before each attempt
                     if atomic.LoadInt32(&stopFlag) == 1 {
                         return
                     }
                     
+                    // Use our cancellable context for the request
                     resp, err = client.Do(req)
                     atomic.AddInt64(&sent, 1)
                     
                     if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-                       
                         break
                     }
                     
-                    // If it's not a connection error or we've run out of retries, stop retrying
                     if err == nil || !isConnectionError(err) || retry == retryMax-1 {
                         break
                     }
                     
-                    // Exponential backoff with jitter
-                    backoff := backoffBase * time.Duration(1<<retry)
-                    jitter := time.Duration(localRand.Int63n(int64(backoff) / 2))
-                    time.Sleep(backoff + jitter)
+                    // Simple backoff between retries
+                    time.Sleep(50 * time.Millisecond << retry)
                 }
                 
+                // Process response or error
                 if err != nil {
-                    if os.IsTimeout(err) || strings.Contains(err.Error(), "timeout") || 
-                       strings.Contains(err.Error(), "deadline exceeded") {
-                        atomic.AddInt64(&timeouts, 1)
-                        // Only sample some timeout errors to avoid flooding
-                        if localRand.Intn(100) < 5 { // Log only 5% of timeouts
-                            errorChan <- fmt.Sprintf("Worker %d: Timeout: %v\n", workerID, err)
+                    if atomic.LoadInt32(&stopFlag) == 0 { // Only count errors if not stopping
+                        if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") {
+                            atomic.AddInt64(&timeouts, 1)
+                            if localRand.Intn(100) < 5 {
+                                errorChan <- fmt.Sprintf("Worker %d: Timeout: %v\n", workerID, err)
+                            }
+                        } else if isConnectionError(err) {
+                            atomic.AddInt64(&connErrors, 1)
+                            if localRand.Intn(100) < 5 {
+                                errorChan <- fmt.Sprintf("Worker %d: Connection error: %v\n", workerID, err)
+                            }
+                        } else {
+                            if localRand.Intn(100) < 10 {
+                                errorChan <- fmt.Sprintf("Worker %d: Request failed: %v\n", workerID, err)
+                            }
                         }
-                    } else if isConnectionError(err) {
-                        atomic.AddInt64(&connErrors, 1)
-                        // Only sample some connection errors
-                        if localRand.Intn(100) < 5 { // Log only 5% of conn errors
-                            errorChan <- fmt.Sprintf("Worker %d: Connection error: %v\n", workerID, err)
-                        }
-                    } else {
-                        // Log all other errors
-                        errorChan <- fmt.Sprintf("Worker %d: Request failed: %v\n", workerID, err)
+                        atomic.AddInt64(&errors, 1)
                     }
-                    atomic.AddInt64(&errors, 1)
                 } else if resp != nil {
+                    // Always safely handle the response body
                     if resp.StatusCode >= 200 && resp.StatusCode < 300 {
                         atomic.AddInt64(&success, 1)
                     } else {
                         atomic.AddInt64(&errors, 1)
-                        // Only sample some HTTP errors
-                        if localRand.Intn(100) < 20 { // Log only 20% of HTTP errors
+                        if localRand.Intn(100) < 20 && atomic.LoadInt32(&stopFlag) == 0 {
                             errorChan <- fmt.Sprintf("Worker %d: HTTP %d: %s\n", workerID, resp.StatusCode, resp.Status)
                         }
                     }
-                    // Always drain and close the body
-                    io.CopyBuffer(io.Discard, resp.Body, buffer)
-                    resp.Body.Close()
+                    
+                    // Always drain and close the body, even during shutdown
+                    if resp.Body != nil {
+                        io.CopyBuffer(io.Discard, resp.Body, buffer)
+                        resp.Body.Close()
+                    }
                 }
-            }
-            
-            // Worker exiting
-            if workerID % 1000 == 0 {
-                fmt.Fprintf(printfWriter, "\nWorker %d shutting down...\n", workerID)
             }
         }(i)
     }
 
-    // Wait for stop signal from either file watcher or OS signal
+    // Wait for any stop signal
     select {
     case <-stopChan:
-        // Stop signal received
+        // Stop signal from file or OS signal
+    case <-ctx.Done():
+        // Parent context was cancelled
     }
 
     // Signal all workers to stop
     atomic.StoreInt32(&stopFlag, 1)
+    // Cancel our context to stop ongoing requests
+    cancel()
+    
+    // Restore original GOMAXPROCS to reduce CPU during shutdown
+    runtime.GOMAXPROCS(originalProcs)
+    
     fmt.Fprintf(printfWriter, "\n⚠️ SERVICE STOPPING: Signal received, shutting down all workers...\n")
     
-    // Wait for all workers with a timeout
+    // Wait for all workers to finish with a reasonable timeout
     waitChan := make(chan struct{})
     go func() {
         wg.Wait()
         close(waitChan)
     }()
     
-    // Give workers up to 5 seconds to gracefully exit
+    // Give workers up to 10 seconds to exit (this is fine as you mentioned)
     select {
     case <-waitChan:
         fmt.Fprintf(printfWriter, "\n✅ SERVICE STOPPING: All workers exited gracefully\n")
-    case <-time.After(5 * time.Second):
-        fmt.Fprintf(printfWriter, "\n⚠️ SERVICE STOPPING: Forcing shutdown after timeout\n")
+    case <-time.After(10 * time.Second):
+        fmt.Fprintf(printfWriter, "\n⚠️ SERVICE STOPPING: Some workers still running after timeout\n")
+    }
+    
+    // Wait for helper goroutines with a shorter timeout
+    helperTimeout := time.After(2 * time.Second)
+    
+    // Wait for error printer
+    select {
+    case <-errPrinterDone:
+    case <-helperTimeout:
+    }
+    
+    // Wait for stats printer
+    select {
+    case <-statsDone:
+    case <-helperTimeout:
     }
 
     // Print final stats
@@ -800,10 +838,9 @@ func HttpTesterWithContext(
         atomic.LoadInt64(&errors), atomic.LoadInt64(&timeouts),
         atomic.LoadInt64(&connErrors))
 
-    // Close error channel
+    // Clean up resources
     close(errorChan)
-    
-    // Clean up all stop files
+    signal.Stop(sig)
     cleanupStopFiles()
 }
 

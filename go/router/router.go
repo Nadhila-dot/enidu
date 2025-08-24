@@ -416,16 +416,15 @@ func StartWebServer() {
 			orig := connector.RedirectPrintf(writer)
 			defer connector.RedirectPrintf(orig)
 
-			// Create a context with cancellation
-			ctx, cancel := context.WithCancel(context.Background())
+			// Create a cancellation function for future extensibility
+			_, cancel := context.WithCancel(context.Background())
 			defer cancel() // Ensure cancellation in any case
 
 			done := make(chan struct{})
 			var testerDone bool
 
 			go func() {
-				connector.HttpTesterWithContext(
-					ctx,
+				connector.HttpTester(
 					req.URL,
 					req.ProxyAddr,
 					req.Concurrency,

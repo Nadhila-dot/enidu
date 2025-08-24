@@ -214,6 +214,58 @@
       padding: 10px;
       margin: 10px 0;
     }
+    /* New styles for stopping state */
+    .log-card.stopping {
+      border: 1px solid #f90;
+      box-shadow: 0 0 5px rgba(255, 153, 0, 0.5);
+    }
+    .log-card.stopping .log-card-header {
+      background-color: #f90;
+    }
+    .stopping-message {
+      background-color: #fff3cd;
+      color: #856404;
+      padding: 3px;
+      margin: 2px 0;
+      border-left: 3px solid #f90;
+      font-weight: bold;
+    }
+    .status-pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 11px;
+      font-weight: bold;
+      margin-left: 8px;
+    }
+    .status-pill.running {
+      background-color: #28a745;
+      color: white;
+    }
+    .status-pill.stopping {
+      background-color: #f90;
+      color: white;
+      animation: pulse 1.2s infinite;
+    }
+    .status-pill.complete {
+      background-color: #6c757d;
+      color: white;
+    }
+    .status-pill.error {
+      background-color: #dc3545;
+      color: white;
+    }
+    @keyframes pulse {
+      0% { opacity: 0.8; }
+      50% { opacity: 1; }
+      100% { opacity: 0.8; }
+    }
+    .job-status {
+      padding: 5px;
+      margin: 5px 0;
+      font-weight: bold;
+      border-radius: 3px;
+    }
   </style>
 </head>
 <body>
@@ -864,12 +916,24 @@
         }
       });
       
-      // Close all websockets
-      Object.keys(activeSockets).forEach(jobId => {
-        if (activeSockets[jobId] && activeSockets[jobId].readyState === WebSocket.OPEN) {
-          activeSockets[jobId].close();
+      // Update all jobs to stopping state
+      Object.keys(jobStats).forEach(jobId => {
+        if (!jobStats[jobId].status || jobStats[jobId].status === 'running') {
+          jobStats[jobId].status = 'stopping';
         }
       });
+      
+      // Update UI
+      renderLogCards();
+      
+      // Close all websockets after a delay to allow for log messages to arrive
+      setTimeout(() => {
+        Object.keys(activeSockets).forEach(jobId => {
+          if (activeSockets[jobId] && activeSockets[jobId].readyState === WebSocket.OPEN) {
+            activeSockets[jobId].close();
+          }
+        });
+      }, 2000);
       
       updateStatus(`Stopped ${totalStopped} test(s) on ${successfulInstances}/${instances.length} instances`);
       
@@ -903,7 +967,7 @@
       updateStatus('All logs cleared');
     });
 
-    // Connect to WebSocket
+    // Connect to WebSocket with improved handling of SERVICE STOPPING messages
     function connectToWebSocket(instanceUrl, wsUrl, jobId) {
       // Close existing socket for this job if any
       if (activeSockets[jobId] && activeSockets[jobId].readyState === WebSocket.OPEN) {
@@ -932,6 +996,14 @@
         };
       }
       
+      // Initialize job stats if not exists
+      if (!jobStats[jobId]) {
+        jobStats[jobId] = {
+          status: 'running',
+          lastUpdated: new Date()
+        };
+      }
+      
       // Create new WebSocket
       const socket = new WebSocket(fullWsUrl);
       activeSockets[jobId] = socket;
@@ -946,26 +1018,65 @@
         try {
           const message = JSON.parse(event.data);
           
-          if (message.type === 'info') {
+          // Handle different message types
+          if (message.type === 'status') {
+            // Explicit status message
+            updateJobStatus(jobId, message.data);
+            addToJobLog(jobId, `\n⚠️ JOB STATUS CHANGED: ${message.data}\n`);
+          } 
+          else if (message.type === 'info') {
             // Store job info in stats
-            jobStats[jobId] = message.data;
+            jobStats[jobId] = { 
+              ...jobStats[jobId], 
+              ...message.data,
+              lastUpdated: new Date()
+            };
             addToJobLog(jobId, `Job Info: ${JSON.stringify(message.data, null, 2)}\n`);
-          } else if (message.type === 'log') {
-            addToJobLog(jobId, `${message.data}\n`);
+          } 
+          else if (message.type === 'log') {
+            // Check for SERVICE STOPPING in log message
+            if (typeof message.data === 'string' && message.data.includes('SERVICE STOPPING')) {
+              updateJobStatus(jobId, 'stopping');
+              addToJobLog(jobId, `\n⚠️ ${message.data}\n`);
+            } else {
+              addToJobLog(jobId, `${message.data}`);
+            }
             
             // Try to parse stats from log line
-            parseStatsFromLog(jobId, message.data);
-          } else {
-            // Legacy format support
-            if (message.log) {
-              addToJobLog(jobId, `${message.log}\n`);
-              parseStatsFromLog(jobId, message.log);
+            if (typeof message.data === 'string') {
+              parseStatsFromLog(jobId, message.data);
             }
+          } 
+          else if (message.log) {
+            // Legacy format - Check for SERVICE STOPPING in log
+            if (message.log.includes('SERVICE STOPPING')) {
+              updateJobStatus(jobId, 'stopping');
+              addToJobLog(jobId, `\n⚠️ ${message.log}\n`);
+            } else {
+              addToJobLog(jobId, `${message.log}\n`);
+            }
+            
+            parseStatsFromLog(jobId, message.log);
           }
           
           renderLogCards();
         } catch (error) {
+          // Handle non-JSON messages
           console.error('Error parsing WebSocket message:', error);
+          
+          // Check if the raw message contains SERVICE STOPPING
+          if (typeof event.data === 'string') {
+            if (event.data.includes('SERVICE STOPPING')) {
+              updateJobStatus(jobId, 'stopping');
+              addToJobLog(jobId, `\n⚠️ ${event.data}\n`);
+            } else {
+              addToJobLog(jobId, `${event.data}\n`);
+            }
+          } else {
+            addToJobLog(jobId, 'Received non-text message\n');
+          }
+          
+          renderLogCards();
         }
       };
       
@@ -988,6 +1099,25 @@
       };
       
       // Render log cards to show the new connection
+      renderLogCards();
+    }
+    
+    // Update job status and track in state
+    function updateJobStatus(jobId, status) {
+      if (!jobStats[jobId]) {
+        jobStats[jobId] = { lastUpdated: new Date() };
+      }
+      
+      const prevStatus = jobStats[jobId].status;
+      jobStats[jobId].status = status;
+      jobStats[jobId].lastUpdated = new Date();
+      
+      // Log status change if different
+      if (prevStatus !== status) {
+        updateStatus(`Job ${jobId} status changed: ${prevStatus || 'unknown'} → ${status}`);
+      }
+      
+      // Update UI
       renderLogCards();
     }
     
@@ -1018,6 +1148,7 @@
       const successMatch = logLine.match(/Success: (\d+)/);
       const errorsMatch = logLine.match(/Errors: (\d+)/);
       const timeoutsMatch = logLine.match(/Timeouts: (\d+)/);
+      const connErrorsMatch = logLine.match(/ConnErrs: (\d+)/);
       
       if (sentMatch || rpsMatch || successMatch || errorsMatch) {
         if (!jobStats[jobId]) {
@@ -1029,12 +1160,37 @@
         if (successMatch) jobStats[jobId].success = parseInt(successMatch[1]);
         if (errorsMatch) jobStats[jobId].errors = parseInt(errorsMatch[1]);
         if (timeoutsMatch) jobStats[jobId].timeouts = parseInt(timeoutsMatch[1]);
+        if (connErrorsMatch) jobStats[jobId].connErrors = parseInt(connErrorsMatch[1]);
         
         jobStats[jobId].lastUpdated = new Date();
       }
     }
 
-    // Render log cards for all active jobs
+    // Format log content to highlight special messages
+    function formatLogContent(logs) {
+      return logs.split('\n').map(line => {
+        if (line.includes('SERVICE STOPPING')) {
+          return `<div class="stopping-message">${escapeHtml(line)}</div>`;
+        } else if (line.includes('⚠️')) {
+          return `<div style="color:#d73a49;font-weight:bold">${escapeHtml(line)}</div>`;
+        } else if (line.includes('ERROR:')) {
+          return `<div style="color:#d73a49">${escapeHtml(line)}</div>`;
+        }
+        return escapeHtml(line);
+      }).join('\n');
+    }
+    
+    // Helper function to escape HTML in log messages
+    function escapeHtml(unsafe) {
+      return unsafe
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+    }
+
+    // Render log cards for all active jobs with enhanced visualization
     function renderLogCards() {
       // Get all job IDs from both active sockets and job logs
       const allJobIds = new Set([
@@ -1067,21 +1223,47 @@
         const logs = jobLogs[jobId]?.logs || '';
         const stats = jobStats[jobId] || {};
         const instanceUrl = jobLogs[jobId]?.instanceUrl || '';
+        const jobStatus = stats.status || (isActive ? 'running' : 'closed');
         
         const card = document.createElement('div');
         card.className = 'log-card';
+        
+        // Add status-specific class
+        if (jobStatus === 'stopping') {
+          card.classList.add('stopping');
+        }
         
         // Card header
         const header = document.createElement('div');
         header.className = 'log-card-header';
         
         const title = document.createElement('h3');
-        title.innerHTML = `Job: <strong>${jobId}</strong> ${isActive ? '(LIVE)' : '(CLOSED)'}`;
+        const statusPill = document.createElement('span');
+        statusPill.className = `status-pill ${jobStatus}`;
+        
+        if (jobStatus === 'running') {
+          statusPill.textContent = 'RUNNING';
+          title.textContent = `Job: ${jobId}`;
+        } else if (jobStatus === 'stopping') {
+          statusPill.textContent = 'STOPPING';
+          title.textContent = `Job: ${jobId}`;
+        } else if (jobStatus === 'complete') {
+          statusPill.textContent = 'COMPLETE';
+          title.textContent = `Job: ${jobId}`;
+        } else if (jobStatus === 'error') {
+          statusPill.textContent = 'ERROR';
+          title.textContent = `Job: ${jobId}`;
+        } else {
+          title.textContent = `Job: ${jobId} ${isActive ? '(LIVE)' : '(CLOSED)'}`;
+        }
+        
+        title.appendChild(statusPill);
         
         const controls = document.createElement('div');
         controls.className = 'log-card-controls';
         
-        if (isActive) {
+        // Only show stop button if job is active and not already stopping
+        if (isActive && jobStatus !== 'stopping') {
           const stopBtn = document.createElement('button');
           stopBtn.textContent = 'Stop';
           stopBtn.onclick = () => stopJob(instanceUrl, jobId);
@@ -1112,6 +1294,33 @@
           info.style.fontSize = '12px';
           info.innerHTML = `<strong>Instance:</strong> ${instanceUrl}`;
           card.appendChild(info);
+        }
+        
+        // Status indicator
+        if (jobStatus === 'stopping') {
+          const statusIndicator = document.createElement('div');
+          statusIndicator.className = 'job-status';
+          statusIndicator.style.backgroundColor = '#fff3cd';
+          statusIndicator.style.color = '#856404';
+          statusIndicator.style.borderLeft = '3px solid #f90';
+          statusIndicator.textContent = '⚠️ Job is stopping - Shutdown in progress...';
+          card.appendChild(statusIndicator);
+        } else if (jobStatus === 'error') {
+          const statusIndicator = document.createElement('div');
+          statusIndicator.className = 'job-status';
+          statusIndicator.style.backgroundColor = '#f8d7da';
+          statusIndicator.style.color = '#721c24';
+          statusIndicator.style.borderLeft = '3px solid #dc3545';
+          statusIndicator.textContent = '❌ Job terminated with errors';
+          card.appendChild(statusIndicator);
+        } else if (jobStatus === 'complete') {
+          const statusIndicator = document.createElement('div');
+          statusIndicator.className = 'job-status';
+          statusIndicator.style.backgroundColor = '#d4edda';
+          statusIndicator.style.color = '#155724';
+          statusIndicator.style.borderLeft = '3px solid #28a745';
+          statusIndicator.textContent = '✅ Job completed successfully';
+          card.appendChild(statusIndicator);
         }
         
         // Card stats
@@ -1154,13 +1363,20 @@
             statsDiv.appendChild(timeoutsStat);
           }
           
+          if (stats.connErrors !== undefined) {
+            const connErrorsStat = document.createElement('div');
+            connErrorsStat.className = 'stat';
+            connErrorsStat.innerHTML = `<span class="stat-value">${stats.connErrors}</span><span class="stat-label">Conn Errors</span>`;
+            statsDiv.appendChild(connErrorsStat);
+          }
+          
           card.appendChild(statsDiv);
         }
         
-        // Card logs
+        // Card logs with formatted content
         const logsDiv = document.createElement('div');
         logsDiv.className = 'log';
-        logsDiv.textContent = logs;
+        logsDiv.innerHTML = formatLogContent(logs);
         logsDiv.scrollTop = logsDiv.scrollHeight; // Auto-scroll to bottom
         card.appendChild(logsDiv);
         
@@ -1227,7 +1443,7 @@
       }
     }
 
-    // Fetch job status
+    // Fetch job status with better handling of SERVICE STOPPING state
     async function fetchJobStatus(instanceUrl, jobId) {
       if (!instanceUrl || !jobId) return;
       
@@ -1238,6 +1454,12 @@
         
         if (response.status === 404) {
           updateStatus(`Job ${jobId} not found (completed)`);
+          
+          // If we have stats for this job, mark it as complete
+          if (jobStats[jobId]) {
+            updateJobStatus(jobId, 'complete');
+          }
+          
           return;
         }
         
@@ -1247,15 +1469,24 @@
         
         const job = await response.json();
         
-        if (job.status === 'complete' || job.status === 'error') {
-          updateStatus(`Job ${jobId} is ${job.status}`);
-          
-          // Update job stats
-          if (!jobStats[jobId]) jobStats[jobId] = {};
-          jobStats[jobId] = {...jobStats[jobId], ...job.stats, status: job.status};
-          
-          renderLogCards();
+        // Update job status and stats
+        updateJobStatus(jobId, job.status);
+        
+        // Add job stats if available
+        if (job.stats) {
+          jobStats[jobId] = {...jobStats[jobId], ...job.stats};
         }
+        
+        // Add log message about status change
+        if (job.status === 'stopping') {
+          addToJobLog(jobId, `\n⚠️ SERVER REPORTED JOB IS STOPPING\n`);
+        } else if (job.status === 'complete') {
+          addToJobLog(jobId, `\n✅ SERVER REPORTED JOB IS COMPLETE\n`);
+        } else if (job.status === 'error') {
+          addToJobLog(jobId, `\n❌ SERVER REPORTED JOB ERROR\n`);
+        }
+        
+        renderLogCards();
         
         // Refresh jobs for this instance
         fetchJobs(instanceUrl);
@@ -1264,11 +1495,16 @@
       }
     }
 
-    // Stop a specific job
+    // Stop a specific job with improved handling of the stopping state
     async function stopJob(instanceUrl, jobId) {
       if (!instanceUrl || !jobId) return;
       
       try {
+        // Update UI immediately to show stopping state
+        updateJobStatus(jobId, 'stopping');
+        addToJobLog(jobId, `\n⚠️ SENDING STOP SIGNAL TO JOB...\n`);
+        renderLogCards();
+        
         updateStatus(`Stopping job ${jobId} on ${instanceUrl}...`);
         
         const response = await fetch(`${instanceUrl}/api/v1/jobs/${jobId}`, {
@@ -1284,7 +1520,8 @@
         updateStatus(`Job ${jobId} status: ${data.status}`);
         
         // Add to job logs
-        addToJobLog(jobId, `\nStopping job by user request. Status: ${data.status}\n`);
+        addToJobLog(jobId, `\n⚠️ Stop signal sent. Server response: ${data.status}\n`);
+        addToJobLog(jobId, `⚠️ Waiting for SERVICE STOPPING confirmation...\n`);
         renderLogCards();
         
         // Refresh job list
